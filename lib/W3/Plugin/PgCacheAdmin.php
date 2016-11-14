@@ -105,6 +105,8 @@ class W3_Plugin_PgCacheAdmin extends W3_Plugin {
             }
         }
 
+        if (!$this->_config->get_boolean('pgcache.prime.enabled')) return;
+        
         $interval = $this->_config->get_integer('pgcache.prime.interval');
         $limit = $this->_config->get_integer('pgcache.prime.limit');
         $sitemap = $this->_config->get_string('pgcache.prime.sitemap');
@@ -114,6 +116,8 @@ class W3_Plugin_PgCacheAdmin extends W3_Plugin {
          */
         $urls = $this->parse_sitemap($sitemap);
 
+        if ($limit <= 0) $limit = count($urls);
+        
         /**
          * Queue URLs
          */
@@ -135,6 +139,246 @@ class W3_Plugin_PgCacheAdmin extends W3_Plugin {
         // which blocks caching
         foreach ($queue as $url)
             w3_http_get($url, array('user-agent' => ''));
+    }
+
+    /**
+     * Prime cache (WP-CLI)
+     *
+     */
+    function prime_cli($limit=0,$interval=0,$sitemap="",$start,$boot=false) {
+        if ($boot)
+        {
+            /**
+             * Don't start cache prime if queues are still scheduled
+             */
+
+            if ((extension_loaded('sysvmsg') && msg_stat_queue(msg_get_queue(99909))['msg_qnum'] > 0) || 
+               $this->get_cli_pids()!==false) {
+                return false;
+            }
+
+            $crons = _get_cron_array();
+
+            foreach ($crons as $timestamp => $hooks) {
+                foreach ($hooks as $hook => $keys) {
+                    foreach ($keys as $key => $data) {
+                        if ($hook == 'w3_pgcache_prime_cli' && count($data['args'])) {
+                            return false;
+                        }
+                    }
+                }
+            }
+            
+            $this->delete_cli_urls();
+
+            if ($limit < 0) $limit = 0;
+            if ($interval < 0) $interval = 0;
+
+            wp_schedule_single_event(time(), 'w3_pgcache_prime_cli', array(
+                            $limit,
+                            $interval,
+                            $sitemap,
+                            $start
+            ));
+
+            return "(" . ($limit == 0 ? "" : "batch: $limit pages every $interval secs - ") . "sitemap: $sitemap)";
+        }
+        else
+        {
+            /**
+             * Parse XML sitemap
+             */
+             
+            $write = true;
+            
+            if (($urls=$this->get_cli_urls())===false) {
+                $urls = $this->parse_sitemap($sitemap);
+            }
+            else
+                $write = false;
+
+            if ($limit == 0) $limit = count($urls);
+
+            if (count($urls) == 0) {
+                error_log('WP-CLI: Prime page cache halted - Unable to load sitemap. A sitemap is needed to prime the page cache.');
+                return;
+            }
+            else if ($write && ($start + $limit) < count($urls)){
+                $this->set_cli_urls($urls);
+            }
+
+            /**
+             * Queue URLs
+             */
+            $queue = array_slice($urls,$start,$limit);
+
+            if (count($queue) > 0)
+            {
+                $usefile=true;
+                $msgidmain = null;
+                $msgidproc = null;
+
+                if (extension_loaded('sysvmsg'))
+                {
+                    $usefile = false;
+                    $msgidmain = msg_get_queue(99909);
+                    $msgidproc = msg_get_queue(99910);
+
+                    msg_send($msgidproc,99,"prime_proc");
+                }
+            
+                /**
+                 * Make HTTP requests and prime cache
+                 */
+                w3_require_once(W3TC_INC_DIR . '/functions/http.php');
+                w3_require_once(W3TC_INC_DIR . '/functions/url.php');
+
+                if ($usefile)
+                {
+                    $pid = getmypid();
+
+                    if (($pids=$this->get_cli_pids()) === false)
+                        $pids = array();
+
+                    $pids[] = $pid;
+                    $this->set_cli_pids($pids);
+                }
+                
+                if (count($urls) > ($start + $limit)) {
+                    wp_schedule_single_event(time() + $interval, 'w3_pgcache_prime_cli', array(
+                        $limit,
+                        $interval,
+                        $sitemap,
+                        $start + $limit
+                    ));
+                }
+                else
+                    $done = true;
+
+                // use empty user-agent since by default we use W3TC-powered by
+                // which blocks caching
+                foreach ($queue as $url)
+                {
+                    w3_http_get($url, array('user-agent' => ''));
+                    if ($msgidmain != null && msg_stat_queue($msgidmain)['msg_qnum'] == 0) break;
+                }
+
+                if ($usefile)
+                {
+                    if (($pids=$this->get_cli_pids()) !== false)
+                    {
+                        unset($pids[array_search($pid,$pids)]);
+                        $this->set_cli_pids($pids);
+                    }
+
+                    if (isset($done) && ($pids===false || count($pids) == 0))
+                    {
+                        $this->delete_cli_pids();
+                        $this->delete_cli_urls();
+                        
+                        exit("Page cache priming via WP-CLI has successfully completed.\n");
+                    }
+                }
+                else
+                {
+                    msg_receive($msgidproc,99,$t,1024,$data,true,MSG_IPC_NOWAIT);
+
+                    if (msg_stat_queue($msgidproc)['msg_qnum'] == 0) {
+                        msg_remove_queue($msgidproc);
+
+                        if (msg_stat_queue($msgidmain)['msg_qnum'] == 0) {
+                            msg_remove_queue($msgidmain);
+                            
+                            if (isset($done)) {
+                                $this->delete_cli_urls();
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /**
+     * Gets the active process ids handling WP-CLI prime caching
+     *     
+     * @return array
+     */
+    function get_cli_pids()
+    {
+        return w3_lock_read($this->generate_filename(W3TC_CLI_PIDS));
+    }
+
+    /**
+     * Adds (or Removes) a process id handling WP-CLI prime caching
+     *
+     * @param array 
+     * @return void
+     */
+    function set_cli_pids($data)
+    {
+        w3_lock_write($this->generate_filename(W3TC_CLI_PIDS),$data);
+    }
+
+    /**
+     * Deletes the WP-CLI prime caching support file for process IDs
+     *     
+     * @return void
+     */
+    function delete_cli_pids()
+    {
+        @unlink($this->generate_filename(W3TC_CLI_PIDS));
+    }
+
+    /**
+     * Gets sitemap urls (originally stored via set_cli_urls) for WP-CLI prime caching
+     *     
+     * @return array
+     */
+    function get_cli_urls()
+    {
+        return w3_lock_read($this->generate_filename(W3TC_CLI_URLS));
+    }
+
+    /**
+     * Stores sitemap urls for WP-CLI prime caching
+     *
+     * @param array 
+     * @return void
+     */
+    function set_cli_urls($data)
+    {
+        w3_lock_write($this->generate_filename(W3TC_CLI_URLS),$data);
+    }
+
+    /**
+     * Deletes the WP-CLI prime caching support file for sitemap URLs
+     *     
+     * @return void
+     */
+    function delete_cli_urls()
+    {
+        @unlink($this->generate_filename(W3TC_CLI_URLS));
+    }
+    
+    /**
+     * Gets the temporary CLI file name to use
+     *     
+     * @return string - full file path
+     */
+    function generate_filename($file,$dir=W3TC_CACHE_TMP_DIR)
+    {
+        if (!is_dir($dir) || !is_writable($dir)) {
+            w3_mkdir_from($dir,W3TC_CACHE_DIR);
+            
+            if (!is_dir($dir) || !is_writable($dir)) {
+                $dir="";
+            }
+            
+            $dir = rtrim($dir,"/");
+        }
+        
+        return $dir . (empty($dir)?"":"/") . $file;
     }
 
     /**

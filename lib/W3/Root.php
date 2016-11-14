@@ -54,6 +54,7 @@ class W3_Root {
 //            $this->_plugins[] = array('class_name' => 'W3_Widget_MaxCDN', 'enable_options' => array(array('cdn.engine', '==', 'maxcdn'),'||', array('cdn.engine', '!=', 'netdna')));
 //            $this->_plugins[] = array('class_name' => 'W3_Widget_NetDNA', 'enable_options' => array(array('cdn.engine', '==', 'netdna')));
 //            $this->_plugins[] = array('class_name' => 'W3_Widget_NewRelic', 'enable_options' => null);
+            $this->_plugins[] = array('class_name' => 'W3_Widget_Releases', 'enable_options' => null);
             $this->_plugins[] = array('class_name' => 'W3_Widget_PageSpeed', 'enable_options' => 'widget.pagespeed.enabled');
             $this->_plugins[] = array('class_name' => 'W3_AdminCompatibility', 'enable_options' => null);
 //            if (!(defined('W3TC_PRO') || w3_is_enterprise()))
@@ -103,6 +104,9 @@ class W3_Root {
      * Deactivation action hook
      */
     public function deactivate() {
+        w3_require_once(W3TC_LIB_W3_DIR . '/Cli.php');
+        wpcli_stop_prime();
+        
         $activation = w3_instance('W3_RootAdminActivation');
         $activation->deactivate();
     }
